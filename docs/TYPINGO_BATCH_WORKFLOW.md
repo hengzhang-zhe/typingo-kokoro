@@ -1,65 +1,35 @@
 # Typingo offline audio workflow
 
-Typingo Kokoro can be used as an offline audio production tool for Typingo. Typingo does not need to call Typingo Kokoro in production.
+Typingo owns content IDs, source text and requested voice variants. Kokoro generates offline audio; no production connection to Kokoro is required.
 
-## 1. Export from Typingo Admin
+## Export a task
 
-Use the **导出 TTS 内容** action on the learning-content page. The downloaded file is `typingo-tts-export.json` and contains stable Typingo `contentId`, content type, language, and source text.
+In Typingo Admin, choose learning or preview items and select voices (including Select All). Learning tasks support selected items or a custom filtered count from 1 to 10000. Export the task ZIP. ZIP contains one compact JSON document; JSON and GZIP are also accepted, using the canonical v3 contract.
 
-By default Typingo exports published English word/sentence/paragraph content that does not already have a ready primary audio asset.
+The v3 task contains `schemaVersion`, `outputMode`, `voices` and `items`. Top-level voice profiles contain only `voice` and `locale`; each item contains `contentId`, `text`, explicit voice IDs and a SHA-256 `snapshot`. Word targets additionally require `pronunciationId`, `locale` and definite dictionary `ipa`. No default voices are added.
 
-## 2. Generate four voice variants
+## Generate
 
-With Typingo Kokoro running on port 9000:
+Upload the task in Batch Audio Studio at the configured service URL (default port 9000), or run:
 
 ```powershell
-.\scripts\batch-generate.ps1 -InputFile "D:\Downloads\typingo-tts-export.json"
+.\scripts\batch-generate.ps1 -InputFile ".\tasks\typingo-tts-export.zip"
 ```
 
-Each content item gets four default variants:
+The script uses the same import/generate/download batch API as the web UI. Results use ZIP. Reports and generated files remain under `output/batches/<jobId>/` on the generation server.
 
-- `af_heart` / `en-US` / American female
-- `am_michael` / `en-US` / American male
-- `bf_emma` / `en-GB` / British female
-- `bm_george` / `en-GB` / British male
+## Import the result
 
-Output:
+`outputMode=bundle` (default) produces `audio-manifest.json` plus `audio/`, with each audio file at its manifest object key. Import the ZIP directly in Typingo; it validates all audio files before uploading them to the current object storage and registering associations.
 
-```text
-output/
-└─ batch-YYYYMMDD-HHMMSS/
-   ├─ audio/
-   │  └─ kokoro/
-   │     └─ <contentId>/
-   │        ├─ af_heart.mp3
-   │        ├─ am_michael.mp3
-   │        ├─ bf_emma.mp3
-   │        └─ bm_george.mp3
-   └─ audio-manifest.json
-```
+`outputMode=manifest` produces only `audio-manifest.json`, containing the successful updates from the current task. Put the local audio files into object storage manually, preserving object keys, or use the separate audio ZIP download and import that ZIP first. Then import the manifest ZIP. An audio-only ZIP uploads files without creating database associations; a manifest-only ZIP registers associations without uploading audio. The script can download the separate audio ZIP with `-DownloadAudio`.
 
-## 3. Upload audio files
+Generated manifests omit deployment-specific storage fields. Typingo resolves those fields using its configured local/S3/OSS storage. Existing explicit storage fields remain supported. Partial failures are excluded from the manifest; reports remain local. Re-export missing tasks after importing successful results.
 
-Copy the contents of the generated `audio/` directory into the root of Typingo storage. If production uses `STORAGE_LOCAL_ROOT=/data/storage`, then:
+Object uploads and database registration are separate operations. If registration fails, uploaded files remain available for a corrected retry. Typingo uploads audio in 4MB chunks (256KB fallback after 413), accepts up to 10GB per file, then processes it as a background job. Manifests are parsed from disk and committed in 500-asset transactions; corrected retries reuse existing associations. Upload and database transactions are separate, so successful earlier batches remain if a later batch fails.
 
-```text
-audio/kokoro/<contentId>/af_heart.mp3
-```
+### Large batches
 
-must end up at:
+Task files and their expanded JSON are limited to 32MB, with up to 10000 distinct content items and 100000 reading targets; reduce the Typingo export count when text exceeds that bound. Studio supports 4MB task-upload chunks with a 256KB fallback after HTTP 413. Generation runs one batch at a time with bounded concurrent audio workers (calculated once at startup). Interrupted jobs can resume in Studio; intact successful files are reused after checksum validation. Long waveforms are appended to a temporary WAV rather than concatenated in memory; result assets and failures are staged as JSONL. Results split at approximately 256MB of audio or 5000 manifest entries. Every result part is an independent ZIP with its own manifest. Download and import all parts; never concatenate their ZIP bytes. Separate audio downloads also accept `?part=N`. The CLI downloads all result parts sequentially. A single generated audio must fit Typingo's 100MB object limit; the temporary WAV has a 2GB safety bound.
 
-```text
-/data/storage/audio/kokoro/<contentId>/af_heart.mp3
-```
-
-The physical path must match the manifest `objectKey`.
-
-## 4. Import the manifest
-
-In Typingo Admin choose **导入音频清单** and upload `audio-manifest.json`.
-
-Typingo registers each file as a `media_asset` and links it back to the original learning content through `content_media_asset`. SHA-256 and object-key identities allow repeated imports to reuse assets rather than blindly creating duplicates.
-
-## Design boundary
-
-Typingo remains the source of truth for content IDs and text. Typingo Kokoro remains an offline speech-production service. Binary audio stays outside Git and outside PostgreSQL; the JSON manifest is the contract connecting generated files back to Typingo.
+Word audio is synthesized from explicit IPA through a strict English Misaki mapping, never from guessed spelling. Unsupported symbols, ambiguous optional forms and absent relationships are reported in the Studio review list and local generation report; successful targets can continue. This is target identity validation, not a guarantee of perceptual quality. Inspect representative generated recordings before publishing. Manifests use `typingo-audio-manifest/v2`; object keys include a pronunciation snapshot so different readings of one word cannot overwrite each other. Resume validates target identity, locale and checksums against the task.

@@ -41,20 +41,21 @@
         <label class="upload" id="drop">
           <div>
             <strong>上传 Typingo TTS 任务文件</strong>
-            <p>支持 typingo-tts-export.json；任务中必须保留 contentId 与明确的 Voice variants。</p>
-            <span class="file-btn">选择 JSON 文件</span>
-            <input id="file" type="file" accept="application/json,.json"/>
+            <p>支持 ZIP、JSON、GZIP；按任务指定的音色和结果包方式处理。</p>
+            <span class="file-btn">选择任务文件</span>
+            <input id="file" type="file" accept="application/json,application/zip,application/gzip,.json,.zip,.gz"/>
           </div>
         </label>
       </div>
 
       <div class="section" id="preview" hidden>
         <div class="summary">
-          <div class="stat"><b id="itemCount">0</b><span>学习项</span></div>
+          <div class="stat"><b id="itemCount">0</b><span>读音任务</span></div>
           <div class="stat"><b id="audioCount">0</b><span>待生成音频</span></div>
           <div class="stat"><b id="voiceCount">0</b><span>Voice 数量</span></div>
           <div class="stat"><b id="failedCount">0</b><span>失败</span></div>
         </div>
+        <p id="taskReview" role="status"></p><details><summary>待核对报告</summary><pre id="taskReviewDetails" style="max-height:240px;overflow:auto;white-space:pre-wrap"></pre></details>
         <div class="voices" id="voices"></div>
 
         <div class="actions">
@@ -75,13 +76,13 @@
 
         <div class="result" id="result">
           <div class="steps">
-            <div class="step"><b>1. 下载批次结果</b><p>ZIP 中包含 audio/、audio-manifest.json 和 generation-report.json。</p></div>
-            <div class="step"><b>2. 上传服务器</b><p>将 ZIP 中 audio/ 内容复制到 Typingo 对象存储根目录。</p></div>
-            <div class="step"><b>3. 回导 Typingo</b><p>在音频管理页导入 audio-manifest.json，按 contentId 自动关联。</p></div>
+            <div class="step"><b>1. 下载批次结果</b><p>结果包按任务指定方式包含更新清单，或清单＋音频。</p></div>
+            <div class="step"><b>2. 上传服务器</b><p>仅清单模式：另行上传音频包，或将本地 audio/ 放入对象存储。</p></div>
+            <div class="step"><b>3. 回导 Typingo</b><p>完整包：直接导入 ZIP 自动上传并关联；仅清单包只登记关联。</p></div>
           </div>
           <div class="actions">
             <span id="resultText" class="ok">生成完成</span>
-            <button class="primary" id="download">下载 ZIP</button>
+            <div><button id="downloadAudio">单独下载音频 ZIP</button> <button class="primary" id="download">下载结果 ZIP</button><div id="partLinks"></div></div>
           </div>
         </div>
         <div class="error" id="error" hidden></div>
@@ -92,23 +93,53 @@
 <script>
 const $=id=>document.getElementById(id)
 let job=null, voiceCatalog=new Map(), timer=null
-async function json(url,options){const r=await fetch(url,options);if(!r.ok){let m=await r.text();try{m=JSON.parse(m).detail||m}catch{}throw new Error(m)}return r.json()}
+async function json(url,options){const r=await fetch(url,options);if(!r.ok){let m=await r.text();try{m=JSON.parse(m).detail||m}catch{}const error=new Error(m);error.status=r.status;throw error}return r.json()}
 async function init(){
   try{
-    const h=await json('/health');$('health').textContent=h.loaded?'模型已就绪 · '+h.device:'模型加载中'
+    const h=await json('/health');$('health').textContent=h.loaded?'模型已就绪 · '+h.device+' · 并发 '+h.concurrency:'模型加载中'
     const v=await json('/v1/audio/voices');(v.voices||[]).forEach(x=>voiceCatalog.set(x.voice,x))
+    const recent=await json('/v1/batches');const saved=recent.jobs.find(x=>['running','interrupted','failed','completed_with_errors'].includes(x.status));if(saved){job=saved;renderPreview();$('progressWrap').hidden=false;poll()}
   }catch(e){$('health').textContent='服务不可用'}
+}
+async function uploadTask(file,chunkBytes=4*1024*1024){
+  if(file.size>32*1024*1024)throw new Error('任务压缩文件不能超过 32MB；请在 Typingo 中减少本次内容数量。')
+  if(file.size<=chunkBytes){
+    const form=new FormData();form.append('file',file)
+    try{return await json('/v1/batches/import',{method:'POST',body:form})}
+    catch(error){if(error.status!==413)throw error;chunkBytes=256*1024}
+  }
+  const uploadId=crypto.randomUUID(),totalChunks=Math.ceil(file.size/chunkBytes)
+  try{
+    for(let index=0;index<totalChunks;index++){
+      const form=new FormData();form.append('file',file.slice(index*chunkBytes,(index+1)*chunkBytes),'task.part')
+      for(const [key,value] of Object.entries({uploadId,index,totalChunks,totalSize:file.size}))form.append(key,String(value))
+      for(let attempt=0;;attempt++){
+        try{await json('/v1/batches/import/chunks',{method:'POST',body:form});break}
+        catch(error){
+          if(error.status===413&&chunkBytes>256*1024)return uploadTask(file,256*1024)
+          if(attempt>=2||(error.status&&error.status<500))throw error
+        }
+      }
+      $('health').textContent='任务上传 '+Math.round((index+1)*100/totalChunks)+'%'
+    }
+    return await json('/v1/batches/import/chunks/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uploadId,totalChunks,totalSize:file.size})})
+  }finally{await fetch('/v1/batches/import/chunks/'+uploadId,{method:'DELETE'}).catch(()=>{})}
 }
 async function upload(file){
   clearError();const form=new FormData();form.append('file',file)
   try{
-    job=await json('/v1/batches/import',{method:'POST',body:form})
+    job=await uploadTask(file)
+    renderPreview()
+  }catch(e){showError(e.message)}
+}
+function renderPreview(){
     $('preview').hidden=false;$('itemCount').textContent=job.itemCount;$('audioCount').textContent=job.audioCount
     $('failedCount').textContent=job.failed||0
     const ids=Object.keys(job.voices||{});$('voiceCount').textContent=ids.length
     $('voices').innerHTML=ids.map(id=>{const v=voiceCatalog.get(id),name=v?.name||id,meta=v?((v.accent==='US'?'美式':'英式')+' · '+(v.gender==='female'?'女声':'男声')):'';return '<span class="voice">'+name+' · '+meta+' · '+job.voices[id]+' 条</span>'}).join('')
-    $('generate').disabled=job.audioCount===0;$('progressWrap').hidden=true;$('result').classList.remove('show')
-  }catch(e){showError(e.message)}
+    $('taskReview').textContent=job.skippedCount ? '有 '+job.skippedCount+' 个目标需要核对，已跳过。详情见下方报告。' : ''; $('taskReviewDetails').textContent=job.skippedCount ? JSON.stringify(job.skipped,null,2) : '';
+    $('generate').disabled=job.audioCount===0||job.status==='running';$('progressWrap').hidden=true;$('result').classList.remove('show')
+    $('generate').textContent=job.completed>0?'继续生成未完成音频':'开始批量生成'
 }
 async function generate(){
   if(!job)return;clearError();$('generate').disabled=true;$('progressWrap').hidden=false;$('result').classList.remove('show')
@@ -120,25 +151,28 @@ async function poll(){
     job=await json('/v1/batches/'+job.id)
     const done=(job.completed||0)+(job.failed||0),total=Math.max(job.audioCount||0,1),pct=Math.min(100,Math.round(done*100/total))
     $('bar').style.width=pct+'%';$('progressPercent').textContent=pct+'%';$('failedCount').textContent=job.failed||0
-    $('progressText').textContent='已处理 '+done+' / '+job.audioCount+' · 成功 '+job.completed+' · 失败 '+job.failed
+    $('progressText').textContent='已处理 '+done+' / '+job.audioCount+' · 成功 '+job.completed+' · 失败 '+job.failed+' · 并发 '+job.concurrency+(job.audioPerSecond?' · '+job.audioPerSecond.toFixed(2)+' 条/秒':'')+(job.etaSeconds!=null?' · 预计剩余 '+formatDuration(job.etaSeconds):'')
     if(job.status==='running'){timer=setTimeout(poll,1000);return}
     if(job.status==='completed'||job.status==='completed_with_errors'){
-      $('result').classList.add('show')
+      $('result').classList.add('show');$('partLinks').replaceChildren();if(job.downloadParts>1){for(let part=1;part<=job.downloadParts;part++){const link=document.createElement('a');link.href='/v1/batches/'+job.id+'/download?part='+part;link.textContent='下载结果包 '+part+' ';link.style.marginRight='12px';$('partLinks').append(link);const audio=document.createElement('a');audio.href='/v1/batches/'+job.id+'/audio/download?part='+part;audio.textContent='音频包 '+part+' ';$('partLinks').append(audio)}}$('download').textContent=job.outputMode==='manifest'?'下载更新清单 ZIP':'下载清单＋音频 ZIP'
       $('resultText').textContent=job.status==='completed'?'全部生成完成':'生成完成，但有 '+job.failed+' 个任务失败'
       $('resultText').className=job.status==='completed'?'ok':'warn'
+      if(job.failed){$('generate').disabled=false;$('generate').textContent='重试失败音频'}
       return
     }
-    $('generate').disabled=false;showError(job.error||'批量生成失败')
+    $('generate').disabled=false;$('generate').textContent='继续生成未完成音频';showError(job.error||(job.status==='interrupted'?'任务已中断，点击继续可保留已完成音频。':'批量生成失败'))
   }catch(e){showError(e.message)}
 }
-$('downloadVoices').addEventListener('click',async()=>{try{const data=await json('/v1/audio/voices');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='voice-catalog.json';a.click();URL.revokeObjectURL(url)}catch(e){showError(e.message)}})
+$('downloadVoices').addEventListener('click',()=>{location.href='/v1/audio/voices/download'})
 $('generate').addEventListener('click',generate)
-$('download').addEventListener('click',()=>{if(job)location.href='/v1/batches/'+job.id+'/download'})
+$('downloadAudio').addEventListener('click',()=>{if(job)location.href='/v1/batches/'+job.id+'/audio/download'})
+$('download').addEventListener('click',()=>{if(job){if(job.downloadParts>1){showError('该任务已拆分为 '+job.downloadParts+' 个独立包，请依次点击下载并导入全部结果包。');return}location.href='/v1/batches/'+job.id+'/download'}})
 $('file').addEventListener('change',e=>{const f=e.target.files?.[0];if(f)upload(f)})
 const drop=$('drop')
 ;['dragenter','dragover'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add('drag')}))
 ;['dragleave','drop'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove('drag')}))
 drop.addEventListener('drop',e=>{const f=e.dataTransfer.files?.[0];if(f)upload(f)})
+function formatDuration(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+' 小时 '+m+' 分钟':m+' 分钟 '+Math.round(s%60)+' 秒'}
 function showError(m){$('error').hidden=false;$('error').textContent=m}
 function clearError(){$('error').hidden=true;$('error').textContent=''}
 init()

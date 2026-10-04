@@ -3,9 +3,13 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+.test-deps/
 .idea/
 .vscode/
 output/*
 !output/.gitkeep
 data/huggingface/*
 !data/huggingface/.gitkeep
+data/cache/
+data/wheels/common/*
+!data/wheels/common/.gitkeep

@@ -13,7 +13,7 @@ MEDIA_TYPES = {
     "opus": "audio/ogg",
 }
 
-def encode_audio(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
+def encode_audio(audio: np.ndarray, sample_rate: int, fmt: str, mp3_quality: int = 0) -> bytes:
     if fmt in {"wav", "flac"}:
         buffer = io.BytesIO()
         sf.write(buffer, audio, sample_rate, format=fmt.upper())
@@ -27,7 +27,7 @@ def encode_audio(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
         sf.write(wav_path, audio, sample_rate, format="WAV")
 
         codec_args = (
-            ["-codec:a", "libmp3lame", "-q:a", "3"]
+            ["-codec:a", "libmp3lame", "-q:a", str(mp3_quality)]
             if fmt == "mp3"
             else ["-codec:a", "libopus", "-b:a", "64k"]
         )
@@ -41,6 +41,7 @@ def encode_audio(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
                 "-y",
                 "-i",
                 str(wav_path),
+                "-threads", "1",
                 *codec_args,
                 str(out_path),
             ],

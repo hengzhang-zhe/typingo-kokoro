@@ -1,0 +1,15 @@
+# docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+services:
+  typingo-kokoro:
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu126
+    environment:
+      KOKORO_SERVE_DEVICE: auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
