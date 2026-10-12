@@ -309,13 +309,13 @@ class KokoroServeEngine:
         self._provenance_cache[voice] = result
         return dict(result)
 
-    async def synthesize_to_file(self, text: str, voice: str, speed: float, target: Path, phonemes: str | list[str] | None = None, overrides: list | None = None) -> dict:
+    async def synthesize_to_file(self, text: str, voice: str, speed: float, target: Path, phonemes: str | None = None, overrides: list | None = None) -> dict:
         if self.model is None:
             raise RuntimeError("Kokoro engine has not been initialized")
         route = resolve_voice(voice)
         return await self._execute(self._synthesize_file_sync, text, voice, speed, route.lang_code, target, phonemes, overrides)
 
-    def _synthesize_file_sync(self, text: str, voice: str, speed: float, lang_code: str, target: Path, phonemes: str | list[str] | None = None, overrides: list | None = None) -> dict:
+    def _synthesize_file_sync(self, text: str, voice: str, speed: float, lang_code: str, target: Path, phonemes: str | None = None, overrides: list | None = None) -> dict:
         model, pipelines = getattr(self._local, "runtime", None) or (self.model, self.pipelines)
         # Long passages append pipeline chunks to disk instead of concatenating
         # every waveform into one NumPy allocation.
@@ -327,16 +327,7 @@ class KokoroServeEngine:
                               channels=1, subtype="PCM_16", format="WAV") as output:
                 pipeline = pipelines[lang_code]
                 if phonemes is not None:
-                    chunks = [phonemes] if isinstance(phonemes, str) else phonemes
-                    def from_saved_chunks():
-                        for chunk in chunks:
-                            if not isinstance(chunk, str) or not chunk.strip() or len(chunk) > 510:
-                                raise ValueError('Invalid persisted phoneme chunk')
-                            unknown = set(chunk) - set(model.vocab)
-                            if unknown:
-                                raise ValueError('Phonemes contain unsupported model symbols')
-                            yield from pipeline.generate_from_tokens(chunk, voice=voice, speed=speed, model=model)
-                    results = from_saved_chunks()
+                    results = pipeline.generate_from_tokens(phonemes, voice=voice, speed=speed, model=model)
                 elif overrides:
                     results = generate_contextual(pipeline, text, overrides, resolve_voice(voice).locale, voice, speed, model)
                 else:

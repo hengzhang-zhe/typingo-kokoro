@@ -266,15 +266,6 @@ async def import_task(raw: bytes) -> dict[str, Any]:
             raise ValueError("Content snapshot mismatch")
 
         synthesis = validate_options(item, required=True)
-        saved_phonemes = item.get('phonemes') or {}
-        if not isinstance(saved_phonemes, dict) or not set(saved_phonemes).issubset({'en-US', 'en-GB'}):
-            raise ValueError('Invalid persisted phoneme locales')
-        if saved_phonemes:
-            from app.g2p import validate_stored
-            for locale, record in saved_phonemes.items():
-                if locale not in {v['locale'] for v in variants} or for_voice(synthesis, locale)['overrides']:
-                    raise ValueError('Persisted G2P cannot replace explicit contextual pronunciation overrides')
-                validate_stored(record, text, locale)
         identities = item.get("identities") or {}
         if not content_id.startswith("preview-") and set(identities) != set(ids):
             raise ValueError("Every voice must have a synthesis identity")
@@ -287,7 +278,7 @@ async def import_task(raw: bytes) -> dict[str, Any]:
             if identity != expected_identity or (identity["contentType"] == "word") != (pid is not None):
                 raise ValueError("Synthesis identity differs from task or supported parameters")
 
-        if pid is not None and item.get('locale') not in saved_phonemes:
+        if pid is not None:
             try:
                 ipa_to_misaki(item.get("ipa"), item.get("locale"))
             except ValueError as exc:
@@ -316,7 +307,7 @@ async def import_task(raw: bytes) -> dict[str, Any]:
                 "contentId": content_id,
                 "text": text,
                 "voices": [v["voice"] for v in normalized_variants],
-                "pronunciationId": pid, "locale": item.get("locale"), "ipa": item.get("ipa"), "snapshot": snapshot, "identities": identities, "synthesis": synthesis, "phonemes": saved_phonemes,
+                "pronunciationId": pid, "locale": item.get("locale"), "ipa": item.get("ipa"), "snapshot": snapshot, "identities": identities, "synthesis": synthesis,
             })
 
     if len({cid for cid, _ in seen_ids}) > 10000:
@@ -468,18 +459,6 @@ async def _run(job: BatchJob) -> None:
 
 
 
-def _phoneme_provenance(item: dict, locale: str, base: dict) -> dict:
-    configured = dict(base)
-    stored = item.get('phonemes', {}).get(locale)
-    if stored:
-        from app.g2p import validate_stored
-        validate_stored(stored, item['text'], locale)
-        configured.update(g2pVersion=stored['g2pVersion'], inputHash=stored['inputHash'],
-            phonemeHash=hashlib.sha256(json.dumps(stored['phonemes'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest(),
-            inputMode='persisted-phonemes')
-    return configured
-
-
 def _recover_assets(job: BatchJob, assets_file: Path, provenance: dict | None = None) -> set[tuple[str, str | None, str]]:
     """Discard incomplete journal tails and retain only intact audio files."""
     task = _read_task(job.source_path)
@@ -512,7 +491,7 @@ def _recover_assets(job: BatchJob, assets_file: Path, provenance: dict | None = 
                             controls = for_voice(item.get("synthesis") or validate_options(item), profiles[voice]["locale"])
                             if recorded.get("speed") != float(controls["speed"]) or recorded.get("mode") != controls["mode"] or recorded.get("overrides") != controls["overrides"]:
                                 continue
-                            configured = _phoneme_provenance(item, profiles[voice]["locale"], provenance[voice])
+                            configured = provenance[voice]
                             if any(recorded.get(k) != v for k, v in configured.items()):
                                 continue
                         expected = _audio_path(item, voice, configured if provenance is not None else None)
@@ -550,10 +529,6 @@ async def _run_one(job: BatchJob) -> None:
     provenance = {}
     for profile in task['voices']:
         provenance[profile['voice']] = await asyncio.to_thread(engine.provenance, profile['voice']) if hasattr(engine, 'provenance') else {}
-    # Validate every stored record even when all audio was completed before restart.
-    for item in task['items']:
-        for locale in item.get('phonemes', {}):
-            _phoneme_provenance(item, locale, {})
     recovered = await _thread_operation(_recover_assets, job, assets_file, provenance)
     job.completed = len(recovered)
     job.initial_completed = job.completed
@@ -588,8 +563,7 @@ async def _run_one(job: BatchJob) -> None:
                 voice = variant["voice"]
                 locale = variant["locale"]
                 try:
-                    stored = item.get('phonemes', {}).get(locale)
-                    configured = _phoneme_provenance(item, locale, provenance[voice])
+                    configured = dict(provenance[voice])
                     relative = _audio_path(item, voice, configured)
                     target = job.root / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -618,16 +592,12 @@ async def _run_one(job: BatchJob) -> None:
                             synthesis = recorded
                         else:
                             if hasattr(engine, "synthesize_to_file"):
-                                options = {'phonemes': stored['phonemes']} if stored else {"phonemes": ipa_to_misaki(item["ipa"], locale)} if item.get("pronunciationId") else {}
+                                options = {"phonemes": ipa_to_misaki(item["ipa"], locale)} if item.get("pronunciationId") else {}
                                 if controls['overrides']:
                                     options['overrides'] = controls['overrides']
                                 generated = await engine.synthesize_to_file(text=text, voice=voice, speed=float(controls['speed']), target=target, **options)
                                 if isinstance(generated, dict):
                                     synthesis.update(generated)
-                                    if stored:
-                                        if generated.get('phonemes') != stored['phonemes']:
-                                            raise ValueError('Actual synthesis chunks differ from persisted G2P')
-                                        synthesis['mode'] = controls['mode']
                             else:
                                 if item.get("pronunciationId") or controls["overrides"]:
                                     raise ValueError("Engine does not support explicit pronunciation synthesis")

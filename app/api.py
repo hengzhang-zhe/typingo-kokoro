@@ -275,33 +275,3 @@ async def cancel_task_chunks(upload_id: str):
         root = upload_root(upload_id)
         if root.exists(): shutil.rmtree(root)
     return {"cancelled": True}
-
-
-# G2P uses the existing service, independently of voice and GPU inference.
-from pydantic import BaseModel, Field
-class PhonemeInput(BaseModel):
-    id: str = Field(min_length=1, max_length=128)
-    text: str = Field(min_length=1, max_length=100000)
-    locale: str
-class PhonemeRequest(BaseModel):
-    items: list[PhonemeInput] = Field(min_length=1, max_length=100)
-
-@router.get('/v1/phonemes/version')
-def phoneme_version():
-    from app.g2p import g2p_version
-    return {'g2pVersion': g2p_version()}
-
-@router.post('/v1/phonemes')
-def phonemes(request: PhonemeRequest):
-    from app.g2p import g2p_version, phonemize
-    if len({i.id for i in request.items}) != len(request.items):
-        raise HTTPException(400, 'Duplicate target IDs')
-    if sum(len(i.text) for i in request.items) > 200000:
-        raise HTTPException(413, 'Batch text exceeds 200000 characters')
-    rows = []
-    for item in request.items:
-        try:
-            rows.append({'id': item.id, 'phonemes': phonemize(item.text, item.locale), 'error': None})
-        except ValueError as exc:
-            rows.append({'id': item.id, 'phonemes': [], 'error': str(exc)})
-    return {'g2pVersion': g2p_version(), 'items': rows}

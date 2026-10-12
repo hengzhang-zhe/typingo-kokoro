@@ -337,5 +337,3 @@ retain downloads; deleting them or changing the platform/version may require
 fetching resources again. See [Docker cache mounts](https://docs.docker.com/build/cache/optimize/).
 
 Word audio is synthesized from explicit IPA through a strict English Misaki mapping, never from guessed spelling. Unsupported symbols, ambiguous optional forms and absent relationships are reported in the Studio review list and local generation report; successful targets can continue. This is target identity validation, not a guarantee of perceptual quality. Inspect representative generated recordings before publishing. Manifests use `typingo-audio-manifest/v2`; object keys include a pronunciation snapshot so different readings of one word cannot overwrite each other. Resume validates target identity, locale and checksums against the task.
-
-Optional voice-independent G2P endpoints: `GET /v1/phonemes/version` and `POST /v1/phonemes`. Typingo manages permanent phoneme records; see [architecture](docs/ARCHITECTURE.md) and [batch workflow](docs/TYPINGO_BATCH_WORKFLOW.md).
