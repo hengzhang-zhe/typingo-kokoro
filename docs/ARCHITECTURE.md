@@ -81,11 +81,11 @@ A recommended permanent cache identity is:
 ```text
 SHA256(
     provider
-  | model_revision
+  | model_files_sha256
   | locale
   | voice
   | speed
-  | normalized_text
+  | text | ipa | pronunciation_overrides | format
 )
 ```
 
@@ -109,3 +109,11 @@ There is no separately launched generation service in application code.
 Startup resource planning uses a one-second snapshot, deducts current CPU load and host reserves, and prepares initial model slots and fixed intra-op threads. Batch and HTTP generation share an adjustable admission limiter. A lifecycle-owned sampler reduces concurrency under sustained CPU/memory pressure and probes gradual expansion, including beyond the startup pool, subject to current CPU/RAM/VRAM budgets and the ceiling (8 in automatic mode). New independent models load and warm off the event loop. Non-improving throughput probes revert with a cooldown. Idle surplus models retire on shrink; busy surplus models retire when inference completes, preserving the primary slot. Device selection stays fixed. GPU load is matched by UUID; auto device can choose CPU at startup if the GPU is busy or lacks reserved VRAM. See the README for thresholds, limitations and reserve configuration.
 
 Portable cached wheels, recoverable installed pure Python dependencies and a reconstructed spaCy model-data wheel live in `data/wheels/common`. Docker reads them through a build bind mount; local install helpers use the same find-links directory. Model compatibility metadata is included in the joint dependency resolution. Windows native binaries are never copied into Linux site-packages. Docker pip/apt use persistent BuildKit caches, and the PyTorch layer is independent of application requirements. The Docker build helper also exports container-installed portable dependencies and language data back to the shared wheelhouse without network access.
+
+## Dictionary IPA and stored G2P
+
+Dictionary IPA remains upstream learning data, using separate US/GB broad phonemic records. `app.g2p` converts source text with quiet Misaki/KPipeline (`model=False`), independently of voice and dictionary IPA. GET `/v1/phonemes/version` returns the actual package/data/adapter/fallback fingerprint. POST `/v1/phonemes` accepts at most 100 `{id,text,locale}` targets and 200000 total characters; per-target failures are reported independently. Only `en-US` and `en-GB` are supported.
+
+Typingo persists segmented phonemes by content/reading/locale. Optional task `phonemes` maps each locale to `{inputHash,g2pVersion,phonemes}`. Each chunk is nonempty and at most 510 model symbols. Import, generation and resume validate source hash and current G2P version; the engine uses stored chunks through `generate_from_tokens`, checks the model vocabulary and records actual chunks. Runtime audio cache keys additionally include the stored version and chunk fingerprint. Missing stored phonemes preserve the existing text/explicit-IPA paths; explicit contextual overrides cannot be replaced by default G2P.
+
+Default G2P does not identify a homograph sense. Typingo exports stored reading-level phonemes only where the locale has one definite dictionary IPA; multiple distinct readings retain explicit pronunciation control. Dictionary IPA and historical media are never rewritten from model phonemes.

@@ -20,9 +20,56 @@ from typing import Any
 from app.config import get_settings
 from app.voices import resolve_voice
 from app.pronunciation import ipa_to_misaki
+from app.synthesis import validate_options, for_voice
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 OUTPUT_ROOT = Path("output") / "batches"
+
+
+
+def _identity_key(identity: dict) -> str:
+    fields = ("text", "contentType", "language", "ipa", "locale", "voice", "provider", "model", "speed", "format")
+    if not isinstance(identity, dict) or set(identity) != set(fields) | {"overrides"}:
+        raise ValueError("Invalid synthesis identity fields")
+    if identity["contentType"] not in {"word", "grammar", "sentence", "passage"}:
+        raise ValueError("Invalid synthesis content type")
+    if any(not isinstance(identity[k], str) or not identity[k] for k in fields if k != "ipa"):
+        raise ValueError("Missing synthesis identity value")
+    if identity["ipa"] is not None and not isinstance(identity["ipa"], str):
+        raise ValueError("Invalid synthesis IPA")
+    canonical = "typingo-audio-identity"
+    for key in fields:
+        value = identity[key] or ""
+        canonical += f":{len(value.encode('utf-8'))}:{value}"
+    if not isinstance(identity["overrides"], list):
+        raise ValueError("Invalid synthesis overrides")
+    for o in identity["overrides"]:
+        if not isinstance(o, dict) or set(o) != {"start", "end", "text", "ipa", "locale"}:
+            raise ValueError("Invalid synthesis override fields")
+        for key in ("start", "end", "text", "ipa", "locale"):
+            value = str(o[key])
+            canonical += f":{len(value.encode('utf-8'))}:{value}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _audio_path(item: dict, voice: str, provenance: dict | None = None) -> Path:
+    identity = item.get("identities", {}).get(voice)
+    if identity:
+        if provenance:
+            runtime = hashlib.sha256(json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            combined = hashlib.sha256((_identity_key(identity) + runtime).encode()).hexdigest()
+            return Path("audio") / "kokoro" / "reusable" / f"{combined}.mp3"
+        return Path("audio") / "kokoro" / "reusable" / f"{_identity_key(identity)}.mp3"
+    controls = item.get('synthesis')
+    if provenance:
+        configured = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+        config = json.dumps(controls or validate_options(item), sort_keys=True, separators=(",", ":"))
+        suffix = hashlib.sha256((item['snapshot'] + config + configured).encode()).hexdigest()
+        return Path('audio') / 'kokoro' / item['contentId'] / suffix / f'{voice}.mp3'
+    if controls and controls['speed'] != '1.0':
+        suffix = hashlib.sha256((item['snapshot'] + controls['speed']).encode()).hexdigest()
+        return Path('audio') / 'kokoro' / item['contentId'] / suffix / f'{voice}.mp3'
+    return Path("audio") / "kokoro" / item["contentId"] / item["snapshot"] / f"{voice}.mp3"
 
 
 @dataclass
@@ -111,8 +158,8 @@ def _safe(value: str, field_name: str) -> str:
 
 def _read_task(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
-    if data.get("schemaVersion") not in {"typingo-tts-export/v3"}:
-        raise ValueError("Unsupported task schemaVersion")
+    if data.get("format") not in {"typingo-tts-export"}:
+        raise ValueError("Unsupported task format")
     items = data.get("items")
     if not isinstance(items, list):
         raise ValueError("items must be an array")
@@ -149,8 +196,8 @@ def decode_task(raw: bytes) -> dict[str, Any]:
         data = json.loads(raw.decode("utf-8-sig"))
     except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
         raise ValueError("Invalid task archive") from exc
-    if not isinstance(data, dict) or data.get("schemaVersion") not in {"typingo-tts-export/v3"}:
-        raise ValueError("Unsupported task schemaVersion")
+    if not isinstance(data, dict) or data.get("format") not in {"typingo-tts-export"}:
+        raise ValueError("Unsupported task format")
     return data
 
 
@@ -218,7 +265,29 @@ async def import_task(raw: bytes) -> dict[str, Any]:
         if expected != snapshot:
             raise ValueError("Content snapshot mismatch")
 
-        if pid is not None:
+        synthesis = validate_options(item, required=True)
+        saved_phonemes = item.get('phonemes') or {}
+        if not isinstance(saved_phonemes, dict) or not set(saved_phonemes).issubset({'en-US', 'en-GB'}):
+            raise ValueError('Invalid persisted phoneme locales')
+        if saved_phonemes:
+            from app.g2p import validate_stored
+            for locale, record in saved_phonemes.items():
+                if locale not in {v['locale'] for v in variants} or for_voice(synthesis, locale)['overrides']:
+                    raise ValueError('Persisted G2P cannot replace explicit contextual pronunciation overrides')
+                validate_stored(record, text, locale)
+        identities = item.get("identities") or {}
+        if not content_id.startswith("preview-") and set(identities) != set(ids):
+            raise ValueError("Every voice must have a synthesis identity")
+        for voice, identity in identities.items():
+            _identity_key(identity)
+            expected_identity = {"text": text, "contentType": identity["contentType"], "language": "en",
+                "ipa": item.get("ipa"), "locale": profiles[voice]["locale"], "voice": voice,
+                "provider": "kokoro", "model": get_settings().model_repo, "overrides": [o for o in synthesis["overrides"] if o["locale"] == profiles[voice]["locale"]],
+                "speed": synthesis["speed"], "format": "mp3"}
+            if identity != expected_identity or (identity["contentType"] == "word") != (pid is not None):
+                raise ValueError("Synthesis identity differs from task or supported parameters")
+
+        if pid is not None and item.get('locale') not in saved_phonemes:
             try:
                 ipa_to_misaki(item.get("ipa"), item.get("locale"))
             except ValueError as exc:
@@ -247,7 +316,7 @@ async def import_task(raw: bytes) -> dict[str, Any]:
                 "contentId": content_id,
                 "text": text,
                 "voices": [v["voice"] for v in normalized_variants],
-                "pronunciationId": pid, "locale": item.get("locale"), "ipa": item.get("ipa"), "snapshot": snapshot,
+                "pronunciationId": pid, "locale": item.get("locale"), "ipa": item.get("ipa"), "snapshot": snapshot, "identities": identities, "synthesis": synthesis, "phonemes": saved_phonemes,
             })
 
     if len({cid for cid, _ in seen_ids}) > 10000:
@@ -257,7 +326,7 @@ async def import_task(raw: bytes) -> dict[str, Any]:
     root = OUTPUT_ROOT / job_id
     root.mkdir(parents=True, exist_ok=False)
     source_path = root / "task.json"
-    normalized = {"schemaVersion": "typingo-tts-export/v3", "outputMode": output_mode, "voices": list(profiles.values()), "items": normalized_items, "skipped": skipped}
+    normalized = {"format": data["format"], "outputMode": output_mode, "voices": list(profiles.values()), "items": normalized_items, "skipped": skipped}
     source_path.write_text(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     job = BatchJob(
@@ -399,7 +468,19 @@ async def _run(job: BatchJob) -> None:
 
 
 
-def _recover_assets(job: BatchJob, assets_file: Path) -> set[tuple[str, str | None, str]]:
+def _phoneme_provenance(item: dict, locale: str, base: dict) -> dict:
+    configured = dict(base)
+    stored = item.get('phonemes', {}).get(locale)
+    if stored:
+        from app.g2p import validate_stored
+        validate_stored(stored, item['text'], locale)
+        configured.update(g2pVersion=stored['g2pVersion'], inputHash=stored['inputHash'],
+            phonemeHash=hashlib.sha256(json.dumps(stored['phonemes'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest(),
+            inputMode='persisted-phonemes')
+    return configured
+
+
+def _recover_assets(job: BatchJob, assets_file: Path, provenance: dict | None = None) -> set[tuple[str, str | None, str]]:
     """Discard incomplete journal tails and retain only intact audio files."""
     task = _read_task(job.source_path)
     expected_targets = {(i["contentId"], i.get("pronunciationId"), v): i for i in task["items"] for v in i["voices"]}
@@ -426,7 +507,17 @@ def _recover_assets(job: BatchJob, assets_file: Path) -> set[tuple[str, str | No
                             continue
                         if not re.fullmatch(r"[0-9a-f]{64}", asset["snapshot"]):
                             continue
-                        expected = Path("audio") / "kokoro" / content_id / asset["snapshot"] / f"{voice}.mp3"
+                        if provenance is not None:
+                            recorded = asset.get("synthesis") or {}
+                            controls = for_voice(item.get("synthesis") or validate_options(item), profiles[voice]["locale"])
+                            if recorded.get("speed") != float(controls["speed"]) or recorded.get("mode") != controls["mode"] or recorded.get("overrides") != controls["overrides"]:
+                                continue
+                            configured = _phoneme_provenance(item, profiles[voice]["locale"], provenance[voice])
+                            if any(recorded.get(k) != v for k, v in configured.items()):
+                                continue
+                        expected = _audio_path(item, voice, configured if provenance is not None else None)
+                        if asset.get("identity") != item.get("identities", {}).get(voice):
+                            continue
                         target = job.root / expected
                         if asset["objectKey"] != expected.as_posix() or key in recovered:
                             continue
@@ -453,7 +544,17 @@ def _file_digest(target: Path) -> str:
 async def _run_one(job: BatchJob) -> None:
     assets_file = job.root / "assets.jsonl"
     failures_file = job.root / "failures.jsonl"
-    recovered = await _thread_operation(_recover_assets, job, assets_file)
+    from app.engine import get_engine
+    engine = get_engine()
+    task = _read_task(job.source_path)
+    provenance = {}
+    for profile in task['voices']:
+        provenance[profile['voice']] = await asyncio.to_thread(engine.provenance, profile['voice']) if hasattr(engine, 'provenance') else {}
+    # Validate every stored record even when all audio was completed before restart.
+    for item in task['items']:
+        for locale in item.get('phonemes', {}):
+            _phoneme_provenance(item, locale, {})
+    recovered = await _thread_operation(_recover_assets, job, assets_file, provenance)
     job.completed = len(recovered)
     job.initial_completed = job.completed
     job.failed = 0
@@ -474,6 +575,7 @@ async def _run_one(job: BatchJob) -> None:
                         yield item, variant
 
         tasks = iter(pending())
+        identity_locks = {}
         last_checkpoint = time.monotonic()
         async def worker():
             nonlocal last_checkpoint
@@ -486,17 +588,58 @@ async def _run_one(job: BatchJob) -> None:
                 voice = variant["voice"]
                 locale = variant["locale"]
                 try:
-                    relative = Path("audio") / "kokoro" / content_id / item["snapshot"] / f"{voice}.mp3"
+                    stored = item.get('phonemes', {}).get(locale)
+                    configured = _phoneme_provenance(item, locale, provenance[voice])
+                    relative = _audio_path(item, voice, configured)
                     target = job.root / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    if hasattr(engine, "synthesize_to_file"):
-                        options = {"phonemes": ipa_to_misaki(item["ipa"], locale)} if item.get("pronunciationId") else {}
-                        await engine.synthesize_to_file(text=text, voice=voice, speed=1.0, target=target, **options)
-                    else:
-                        if item.get("pronunciationId"):
-                            raise ValueError("Engine does not support explicit pronunciation synthesis")
-                        data = await engine.synthesize(text=text, voice=voice, speed=1.0, response_format="mp3")
-                        target.write_bytes(data)
+                    identity = item.get("identities", {}).get(voice)
+                    controls = for_voice(item.get("synthesis") or validate_options(item), locale)
+                    runtime_key = hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if configured else None
+                    cache_key = _identity_key(identity) if identity else None
+                    if cache_key and runtime_key:
+                        cache_key = hashlib.sha256((cache_key + runtime_key).encode()).hexdigest()
+                    synthesis = {**configured, "mode": controls["mode"], "speed": float(controls["speed"]),
+                                 "overrides": controls["overrides"], "locale": locale, "voice": voice, "phonemes": None}
+                    lock = identity_locks.setdefault(cache_key or str(relative), asyncio.Lock())
+                    async with lock:
+                        cache = OUTPUT_ROOT / ".audio-cache" / f"{cache_key}.mp3" if cache_key else None
+                        cached = False
+                        if cache and cache.is_file() and cache.with_suffix(".sha256").is_file() and cache.with_suffix(".json").is_file():
+                            digest = await asyncio.to_thread(_file_digest, cache)
+                            cached = digest == cache.with_suffix(".sha256").read_text(encoding="ascii")
+                            try:
+                                recorded = json.loads(cache.with_suffix(".json").read_text(encoding="utf-8"))
+                                cached = cached and isinstance(recorded, dict) and all(recorded.get(k) == v for k, v in synthesis.items() if k != 'phonemes')
+                            except (ValueError, OSError):
+                                cached = False
+                        if cached:
+                            await asyncio.to_thread(shutil.copyfile, cache, target)
+                            synthesis = recorded
+                        else:
+                            if hasattr(engine, "synthesize_to_file"):
+                                options = {'phonemes': stored['phonemes']} if stored else {"phonemes": ipa_to_misaki(item["ipa"], locale)} if item.get("pronunciationId") else {}
+                                if controls['overrides']:
+                                    options['overrides'] = controls['overrides']
+                                generated = await engine.synthesize_to_file(text=text, voice=voice, speed=float(controls['speed']), target=target, **options)
+                                if isinstance(generated, dict):
+                                    synthesis.update(generated)
+                                    if stored:
+                                        if generated.get('phonemes') != stored['phonemes']:
+                                            raise ValueError('Actual synthesis chunks differ from persisted G2P')
+                                        synthesis['mode'] = controls['mode']
+                            else:
+                                if item.get("pronunciationId") or controls["overrides"]:
+                                    raise ValueError("Engine does not support explicit pronunciation synthesis")
+                                data = await engine.synthesize(text=text, voice=voice, speed=float(controls["speed"]), response_format="mp3")
+                                target.write_bytes(data)
+                            if cache and target.stat().st_size <= 100 * 1024 * 1024:
+                                cache.parent.mkdir(parents=True, exist_ok=True)
+                                staged = cache.with_suffix(".partial")
+                                await asyncio.to_thread(shutil.copyfile, target, staged)
+                                staged.replace(cache)
+                                cache.with_suffix(".json").write_text(json.dumps(synthesis, ensure_ascii=False), encoding="utf-8")
+                                cache.with_suffix(".sha256").write_text(await asyncio.to_thread(_file_digest, cache), encoding="ascii")
                     size_bytes = target.stat().st_size
                     if size_bytes > 100 * 1024 * 1024:
                         target.unlink()
@@ -506,6 +649,8 @@ async def _run_one(job: BatchJob) -> None:
                         "contentId": content_id,
                         "role": "pronunciation" if item.get("pronunciationId") else "primary",
                         "pronunciationId": item.get("pronunciationId"), "ipa": item.get("ipa"), "snapshot": item["snapshot"],
+                        "identity": identity,
+                        "synthesis": synthesis,
                         "locale": locale,
                         "voice": voice,
                         "objectKey": relative.as_posix(),
@@ -570,12 +715,16 @@ def _package_results(job: BatchJob, assets_file: Path) -> None:
     def flush():
         nonlocal selected, size
         path = job.root / f"typingo-audio-part-{len(parts) + 1:04d}.zip"
-        manifest = {"schemaVersion": "typingo-audio-manifest/v2", "generatedAt": _now(),
+        manifest = {"format": "typingo-audio-manifest", "generatedAt": _now(),
                     "provider": "kokoro", "model": "hexgrad/Kokoro-82M", "assets": selected}
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             if job.output_mode == "bundle":
+                written = set()
                 for asset in selected:
                     _check_job_running(job)
+                    if asset["objectKey"] in written:
+                        continue
+                    written.add(asset["objectKey"])
                     archive.write(job.root / asset["objectKey"], asset["objectKey"], compress_type=zipfile.ZIP_STORED)
             archive.writestr("audio-manifest.json", json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
         parts.append(path)
@@ -597,7 +746,7 @@ def _package_results(job: BatchJob, assets_file: Path) -> None:
         job.zip_path = target
     # Full local manifest remains useful for manual audio processing, streamed from disk.
     with (job.root / "audio-manifest.json").open("w", encoding="utf-8") as output:
-        output.write(json.dumps({"schemaVersion": "typingo-audio-manifest/v2", "generatedAt": _now(), "provider": "kokoro", "model": "hexgrad/Kokoro-82M"})[:-1] + ',"assets":[')
+        output.write(json.dumps({"format": "typingo-audio-manifest", "generatedAt": _now(), "provider": "kokoro", "model": "hexgrad/Kokoro-82M"})[:-1] + ',"assets":[')
         with assets_file.open(encoding="utf-8") as source:
             first = True
             for line in source:

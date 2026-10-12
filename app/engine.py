@@ -20,6 +20,10 @@ from kokoro import KModel, KPipeline
 from app.audio import encode_audio
 from app.config import Settings, get_settings
 from app.voices import resolve_voice
+from app.synthesis import generate_contextual
+from importlib.metadata import version
+import hashlib
+from huggingface_hub import try_to_load_from_cache
 from app.resources import plan_resources, startup_snapshot, lower_cpu_priority
 from app.adaptive import AdjustableLimiter, AdaptivePolicy
 
@@ -44,6 +48,9 @@ class KokoroServeEngine:
         self._local = threading.local()
         self._pool_ready = False
         self._stopping = threading.Event()
+        self._provenance_cache = {}
+        self._asset_hashes = {}
+        self._ffmpeg_version = None
 
     def load(self) -> None:
         self._stopping.clear()
@@ -268,25 +275,76 @@ class KokoroServeEngine:
                 route.lang_code,
             )
 
-    async def synthesize_to_file(self, text: str, voice: str, speed: float, target: Path, phonemes: str | None = None) -> None:
+    def provenance(self, voice: str) -> dict:
+        if voice in self._provenance_cache:
+            return dict(self._provenance_cache[voice])
+        files = {}
+        for name in ('config.json', KModel.MODEL_NAMES[self.settings.model_repo], f'voices/{voice}.pt'):
+            path = try_to_load_from_cache(self.settings.model_repo, name)
+            if isinstance(path, str):
+                if path not in self._asset_hashes:
+                    digest = hashlib.sha256()
+                    with open(path, 'rb') as source:
+                        while chunk := source.read(1024 * 1024):
+                            digest.update(chunk)
+                    self._asset_hashes[path] = digest.hexdigest()
+                files[name] = self._asset_hashes[path]
+        # Ensure the voice has been downloaded before fingerprinting it.
+        if f'voices/{voice}.pt' not in files:
+            self.pipelines[resolve_voice(voice).lang_code].load_voice(voice)
+            path = try_to_load_from_cache(self.settings.model_repo, f'voices/{voice}.pt')
+            if not isinstance(path, str):
+                raise RuntimeError('Cannot identify loaded voice weights')
+            files[f'voices/{voice}.pt'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        if len(files) != 3:
+            raise RuntimeError('Cannot identify loaded model weights and configuration')
+        if self._ffmpeg_version is None:
+            self._ffmpeg_version = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
+        adapter = hashlib.sha256((Path(__file__).with_name('pronunciation.py').read_bytes() + Path(__file__).with_name('synthesis.py').read_bytes())).hexdigest()
+        environment = '\n'.join([version('kokoro'), version('misaki'), version('torch'), self._ffmpeg_version])
+        result = dict(model=self.settings.model_repo,
+                      environmentSha256=hashlib.sha256(environment.encode('utf-8')).hexdigest(),
+                      adapterSha256=adapter, assetsSha256=files, sampleRate=self.settings.sample_rate,
+                      format='mp3', mp3Quality=self.settings.mp3_quality)
+        self._provenance_cache[voice] = result
+        return dict(result)
+
+    async def synthesize_to_file(self, text: str, voice: str, speed: float, target: Path, phonemes: str | list[str] | None = None, overrides: list | None = None) -> dict:
         if self.model is None:
             raise RuntimeError("Kokoro engine has not been initialized")
         route = resolve_voice(voice)
-        await self._execute(self._synthesize_file_sync, text, voice, speed, route.lang_code, target, phonemes)
+        return await self._execute(self._synthesize_file_sync, text, voice, speed, route.lang_code, target, phonemes, overrides)
 
-    def _synthesize_file_sync(self, text: str, voice: str, speed: float, lang_code: str, target: Path, phonemes: str | None = None) -> None:
+    def _synthesize_file_sync(self, text: str, voice: str, speed: float, lang_code: str, target: Path, phonemes: str | list[str] | None = None, overrides: list | None = None) -> dict:
         model, pipelines = getattr(self._local, "runtime", None) or (self.model, self.pipelines)
         # Long passages append pipeline chunks to disk instead of concatenating
         # every waveform into one NumPy allocation.
         with tempfile.TemporaryDirectory(prefix="typingo-wave-") as temporary:
             waveform = Path(temporary) / "wave.wav"
             frames = 0
+            actual_phonemes = []
             with sf.SoundFile(waveform, mode="w", samplerate=self.settings.sample_rate,
                               channels=1, subtype="PCM_16", format="WAV") as output:
-                results = pipelines[lang_code].generate_from_tokens(phonemes, voice=voice, speed=speed, model=model) if phonemes is not None else pipelines[lang_code](text, voice=voice, speed=speed, model=model)
+                pipeline = pipelines[lang_code]
+                if phonemes is not None:
+                    chunks = [phonemes] if isinstance(phonemes, str) else phonemes
+                    def from_saved_chunks():
+                        for chunk in chunks:
+                            if not isinstance(chunk, str) or not chunk.strip() or len(chunk) > 510:
+                                raise ValueError('Invalid persisted phoneme chunk')
+                            unknown = set(chunk) - set(model.vocab)
+                            if unknown:
+                                raise ValueError('Phonemes contain unsupported model symbols')
+                            yield from pipeline.generate_from_tokens(chunk, voice=voice, speed=speed, model=model)
+                    results = from_saved_chunks()
+                elif overrides:
+                    results = generate_contextual(pipeline, text, overrides, resolve_voice(voice).locale, voice, speed, model)
+                else:
+                    results = pipeline(text, voice=voice, speed=speed, model=model)
                 for result in results:
                     self._check_running()
                     if result.audio is not None:
+                        actual_phonemes.append(result.phonemes)
                         chunk = np.asarray(result.audio, dtype=np.float32)
                         output.write(chunk)
                         frames += len(chunk)
@@ -297,6 +355,10 @@ class KokoroServeEngine:
             self._check_running()
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(waveform),
                             "-threads", "1", "-codec:a", "libmp3lame", "-q:a", str(self.settings.mp3_quality), str(target)], check=True)
+            return {**self.provenance(voice), "phonemes": actual_phonemes, "speed": speed,
+                    "locale": resolve_voice(voice).locale, "voice": voice,
+                    "mode": "ipa" if phonemes is not None else "mixed" if overrides else "text",
+                    "overrides": overrides or []}
 
     def _synthesize_sync(
         self,

@@ -1,3 +1,4 @@
+from current_task import current_task
 """Batch contract tests use fake synthesis; no model download is required."""
 import asyncio
 import torch  # Keep native Torch loaded outside patch.dict module restoration.
@@ -31,12 +32,12 @@ class BatchExchangeTest(unittest.TestCase):
         self.temp.cleanup()
 
     def task(self, mode='bundle'):
-        return {'schemaVersion': 'typingo-tts-export/v3', 'outputMode': mode,
+        return {'format': 'typingo-tts-export', 'outputMode': mode,
                 'voices': [{'voice': 'af_heart', 'locale': 'en-US'}, {'voice': 'bf_alice', 'locale': 'en-GB'}],
-                'items': [{'contentId': 'item-1', 'text': 'Hello.', 'snapshot': hashlib.sha256(b'Hello.\0\0\0').hexdigest(), 'voices': ['af_heart', 'bf_alice']}]}
+                'items': [{'contentId': 'item-1', 'text': 'Hello.', 'snapshot': hashlib.sha256(b'Hello.\0\0\0').hexdigest(), 'voices': ['af_heart', 'bf_alice'], 'synthesis': {'mode':'text','speed':'1.0','overrides':[]}, 'identities': {v:dict(text='Hello.',contentType='sentence',language='en',ipa=None,locale=locale,voice=v,provider='kokoro',model='hexgrad/Kokoro-82M',overrides=[],speed='1.0',format='mp3') for v,locale in [('af_heart','en-US'),('bf_alice','en-GB')]}}]}
 
     def raw(self, data):
-        return json.dumps(data).encode()
+        return json.dumps(current_task(data)).encode()
 
     def test_batch_workers_allow_recovery_above_current_limit(self):
         from app.adaptive import AdjustableLimiter
@@ -51,7 +52,7 @@ class BatchExchangeTest(unittest.TestCase):
             async def synthesize(self, **kwargs):
                 async with self.limiter:
                     self.peak = max(self.peak, self.limiter.active)
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.08)
                     self.done += 1
                     if self.done == 3:
                         self.concurrency = 2
@@ -61,7 +62,7 @@ class BatchExchangeTest(unittest.TestCase):
         stub = types.ModuleType('app.engine'); stub.get_engine = lambda: engine
         async def run():
             data = self.task()
-            data['items'] = [dict(data['items'][0], contentId=f'item-{index}') for index in range(8)]
+            data['items'] = [dict(contentId=f'item-{index}',text=f'Hello {index}.',snapshot=hashlib.sha256(f'Hello {index}.\0\0\0'.encode()).hexdigest(),voices=['af_heart','bf_alice']) for index in range(8)]
             view = await batch.import_task(self.raw(data))
             job = batch._jobs[view['id']]
             await batch._run_one(job)
@@ -86,9 +87,9 @@ class BatchExchangeTest(unittest.TestCase):
             self.assertEqual(view['outputMode'], 'bundle')
 
     def test_v1_compatibility(self):
-        data = {'schemaVersion': 'typingo-tts-export/v1', 'items': [
+        data = {'format': 'unsupported', 'items': [
             {'contentId': 'item-1', 'text': 'Hello.', 'type': 'word', 'variants': [{'voice': 'af_heart', 'locale': 'en-US'}]}]}
-        with self.assertRaisesRegex(ValueError, 'schemaVersion'):
+        with self.assertRaisesRegex(ValueError, 'format'):
             asyncio.run(batch.import_task(self.raw(data)))
 
     def test_reject_unknown_voice_reference(self):
@@ -202,7 +203,7 @@ class BatchExchangeTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                 catalog = json.loads(archive.read('voice-catalog.json'))
-                self.assertEqual(catalog['schemaVersion'], 'kokoro-voice-catalog/v1')
+                self.assertEqual(catalog['format'], 'kokoro-voice-catalog')
                 self.assertGreater(catalog['count'], 0)
 
     def test_large_bundle_splits_into_independently_parseable_packages(self):
@@ -270,7 +271,8 @@ class BatchExchangeTest(unittest.TestCase):
             engine_module = importlib.import_module('app.engine')
         engine = engine_module.KokoroServeEngine(Settings())
         engine.model = object()
-        engine.pipelines['a'] = lambda *args, **kwargs: (types.SimpleNamespace(audio=np.ones(1000, dtype=np.float32)) for _ in range(50))
+        engine.provenance = lambda voice: {'model': 'test-model'}
+        engine.pipelines['a'] = lambda *args, **kwargs: (types.SimpleNamespace(audio=np.ones(1000, dtype=np.float32), phonemes='lˈɔŋ') for _ in range(50))
         target = Path(self.temp.name) / 'streamed.mp3'
         def encode(command, **kwargs):
             info = sf.info(command[command.index('-i') + 1])
@@ -301,13 +303,13 @@ class BatchExchangeTest(unittest.TestCase):
         stub = types.ModuleType('app.engine'); stub.get_engine = lambda: Engine()
         data = self.task()
         data['items'] *= 1
-        data['items'] += [{'contentId': 'item-2', 'text': 'Hello.', 'snapshot': hashlib.sha256(b'Hello.\0\0\0').hexdigest(), 'voices': ['af_heart', 'bf_alice']}]
+        data['items'] += [{'contentId': 'item-2', 'text': 'Hello.', 'snapshot': hashlib.sha256(b'Hello.\0\0\0').hexdigest(), 'voices': ['af_heart', 'bf_alice'], 'synthesis': {'mode':'text','speed':'1.0','overrides':[]}, 'identities': {v:dict(text='Hello.',contentType='sentence',language='en',ipa=None,locale=locale,voice=v,provider='kokoro',model='hexgrad/Kokoro-82M',overrides=[],speed='1.0',format='mp3') for v,locale in [('af_heart','en-US'),('bf_alice','en-GB')]}}]
         async def run():
             view = await batch.import_task(self.raw(data))
             job = batch.get_job(view['id'])
             await batch._run(job)
             return job
-        with patch.dict(sys.modules, {'app.engine': stub}), patch.object(batch, 'get_settings', return_value=types.SimpleNamespace(max_concurrency=0)):
+        with patch.dict(sys.modules, {'app.engine': stub}), patch.object(batch, 'get_settings', return_value=types.SimpleNamespace(max_concurrency=0,model_repo='hexgrad/Kokoro-82M')):
             job = asyncio.run(run())
         self.assertEqual(peak, 2)
         self.assertEqual(job.completed, 4)
@@ -330,8 +332,10 @@ class BatchExchangeTest(unittest.TestCase):
         self.assertEqual(job.completed, 2)
         self.assertEqual(job.failed, 0)
         calls.clear()
-        target = job.root / 'audio/kokoro/item-1' / self.task()['items'][0]['snapshot'] / 'af_heart.mp3'
+        target = job.root / next(a['objectKey'] for a in json.loads((job.root/'audio-manifest.json').read_text())['assets'] if a['voice']=='af_heart')
         target.write_bytes(b'x' * target.stat().st_size)
+        cache=Path(self.temp.name)/'.audio-cache'/(batch._identity_key(self.task()['items'][0]['identities']['af_heart'])+'.mp3')
+        cache.write_bytes(b'corrupt cache')
         with patch.dict(sys.modules, {'app.engine': stub}):
             asyncio.run(batch._run(job))
         self.assertEqual(calls, ['af_heart'])
