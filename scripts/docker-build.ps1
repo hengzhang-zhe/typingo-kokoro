@@ -16,7 +16,7 @@ try {
     # This short-lived container uses no network and starts no server.
     $wheelMount = "type=bind,source=$projectRoot\data\wheels\common,target=/shared"
     $helperMount = "type=bind,source=$projectRoot\scripts\prepare_shared_cache.py,target=/prepare.py,readonly"
-    & docker run --rm --network none --mount $wheelMount --mount $helperMount --entrypoint python typing-kokoro:latest /prepare.py --destination /shared --pip-cache /nonexistent
+    & docker run --rm --network none --mount $wheelMount --mount $helperMount --entrypoint python typingo-kokoro:latest /prepare.py --destination /shared --pip-cache /nonexistent
     if ($LASTEXITCODE -ne 0) { throw "Exporting container language resources failed." }
 } finally {
     Pop-Location

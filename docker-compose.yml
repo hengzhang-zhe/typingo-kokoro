@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: typing-kokoro:latest
+    image: typingo-kokoro:latest
 
     container_name: typingo-kokoro
 

@@ -39,7 +39,7 @@ docker compose up -d
 docker compose logs -f
 ```
 
-Docker Compose builds the local image as `typing-kokoro:latest` and runs the `typingo-kokoro` service.
+Docker Compose builds the local image as `typingo-kokoro:latest` and runs the `typingo-kokoro` service.
 
 OpenAPI:
 
@@ -110,7 +110,7 @@ Open:
 http://localhost:9000/
 ```
 
-The web UI accepts ZIP, JSON and GZIP tasks exported from Typingo Admin, using the canonical v3 pronunciation-target contract.
+The web UI accepts ZIP, JSON and GZIP tasks exported from Typingo Admin, using the unversioned `typingo-tts-export` explicit-synthesis contract.
 
 Workflow:
 
@@ -141,7 +141,7 @@ The batch processor generates only the voices explicitly requested by each item.
 
 ### Typingo 音频交换包
 
-任务支持 ZIP（一个 JSON）、JSON 与 GZIP，仅接受 `typingo-tts-export/v3`。顶层 `voices` 声明 `voice`/`locale`，每个 item 包含 `contentId`、`text`、`voices` 和内容快照 `snapshot`；单词读音另含 `pronunciationId`、`locale`、`ipa`。最多 10000 个内容项；只生成任务明确指定的音色。
+任务支持 ZIP（一个 JSON）、JSON 与 GZIP，导出使用 `typingo-tts-export`，不使用格式版本。顶层 `voices` 声明 `voice`/`locale`，每个 item 包含 `contentId`、`text`、`voices` 和内容快照 `snapshot`；单词读音另含 `pronunciationId`、`locale`、`ipa`。最多 10000 个内容项；只生成任务明确指定的音色。
 
 `outputMode=bundle`（默认）结果 ZIP 包含 `audio-manifest.json` 和 `audio/`，直接回导 Typingo 即可上传并关联。`outputMode=manifest` 的结果 ZIP 只包含本次成功生成的更新清单；音频留在本地批次目录，可手动放入对象存储或单独下载音频 ZIP 再导入。报告留在本地，不进入交换包。声音目录也提供 ZIP 下载。部分失败的结果只回导成功项，重试前应重新从 Typingo 导出缺失任务。
 
@@ -336,4 +336,6 @@ are not baked into the runtime image. Keep Docker builder caches and `data` to
 retain downloads; deleting them or changing the platform/version may require
 fetching resources again. See [Docker cache mounts](https://docs.docker.com/build/cache/optimize/).
 
-Word audio is synthesized from explicit IPA through a strict English Misaki mapping, never from guessed spelling. Unsupported symbols, ambiguous optional forms and absent relationships are reported in the Studio review list and local generation report; successful targets can continue. This is target identity validation, not a guarantee of perceptual quality. Inspect representative generated recordings before publishing. Manifests use `typingo-audio-manifest/v2`; object keys include a pronunciation snapshot so different readings of one word cannot overwrite each other. Resume validates target identity, locale and checksums against the task.
+Word audio is synthesized from explicit IPA through a strict English Misaki mapping, never from guessed spelling. Unsupported symbols, ambiguous optional forms and absent relationships are reported in the Studio review list and local generation report; successful targets can continue. This is target identity validation, not a guarantee of perceptual quality. Inspect representative generated recordings before publishing. Manifests use `typingo-audio-manifest`; object keys distinguish synthesis identity and runtime version so different readings or configurations cannot overwrite each other. Resume validates target identity, locale and checksums against the task.
+
+Batch tasks now specify text/IPA/contextual-override mode and speed (0.5–2). Confirmed sentence readings can override individual whole-token pronunciations without losing sentence context. Results include actual phoneme chunks and model/voice/config hashes; cache and resume checks distinguish runtime and requested parameter changes. See [the offline workflow](docs/TYPINGO_BATCH_WORKFLOW.md#explicit-synthesis-controls) for the contract.
